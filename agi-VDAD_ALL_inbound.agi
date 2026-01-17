@@ -2608,6 +2608,8 @@ while ( ($drop_timer <= $DROP_TIME) && ($wait_in_queue > 0) && ($MCdrop_override
 	if ($CAMP_callorder =~ /campaign_grade_random/i) {$aco_sub=1;	$agent_call_order = 'order by random_id';}
 	if ($CAMP_callorder =~ /fewest_calls$/i)		{$aco_sub=1;	$agent_call_order = 'order by vicidial_live_inbound_agents.calls_today,vicidial_live_inbound_agents.last_call_finish';}
 	if ($CAMP_callorder =~ /ring_all$/i)			{$aco_sub=0;	$agent_call_order = 'order by vicidial_live_agents.last_state_change';}
+	if ($CAMP_callorder =~ /manual_answer$/i)		{$aco_sub=0;	$agent_call_order = 'order by vicidial_live_agents.last_state_change';}
+
 
 	$vci=0;
 	$INBOUNDcampsSQL="''";
@@ -2649,6 +2651,75 @@ while ( ($drop_timer <= $DROP_TIME) && ($wait_in_queue > 0) && ($MCdrop_override
 	##### END Check for Agent Grab of this call
 	################################################################
 
+	################################################################
+	##### BEGIN Check for Manual Dial Queue agent (ATC Manual Answer)
+	$MANUALdial_user='';
+	$MANUALdial_matched=0;
+	$stmtA = "SELECT mdq_id,user FROM vicidial_manual_dial_queue where phone_number='$phone_number' and status='QUEUE' limit 1;";
+	$sthA = $dbhA->prepare($stmtA) or die "preparing: ",$dbhA->errstr;
+	$sthA->execute or die "executing: $stmtA ", $dbhA->errstr;
+	$sthArows=$sthA->rows;
+		$dbhP=$dbhA;   $mysql_count='02300';   $MEL_aff_rows=$sthArows;   &mysql_error_logging;
+	if ($sthArows > 0)
+		{
+		@aryA = $sthA->fetchrow_array;
+		$MANUALdial_mdq_id = $aryA[0];
+		$MANUALdial_user = $aryA[1];
+		
+		### Check if user is READY or CLOSER status
+		$stmtA = "SELECT vicidial_live_agents.conf_exten,vicidial_live_agents.user,vicidial_live_agents.extension,vicidial_live_agents.server_ip,vicidial_live_agents.on_hook_agent,vicidial_live_agents.on_hook_ring_time,vicidial_live_agents.campaign_id FROM vicidial_live_agents WHERE vicidial_live_agents.user='$MANUALdial_user' and status IN('READY','CLOSER') and ring_callerid='' limit 1;";
+		$sthA = $dbhA->prepare($stmtA) or die "preparing: ",$dbhA->errstr;
+		$sthA->execute or die "executing: $stmtA ", $dbhA->errstr;
+		$sthArows=$sthA->rows;
+			$dbhP=$dbhA;   $mysql_count='02301';   $MEL_aff_rows=$sthArows;   &mysql_error_logging;
+		if ($sthArows > 0)
+			{
+			@aryA = $sthA->fetchrow_array;
+			$VDADconf_exten =			$aryA[0];
+			$VDADuser =					$aryA[1];
+			$VDADextension =			$aryA[2];
+			$VDADserver_ip =			$aryA[3];
+			$VDADon_hook_agent =		$aryA[4];
+			$VDADon_hook_ring_time =	$aryA[5];
+			$log_campaign =				$aryA[6];
+			
+			### CRITICAL: Set these variables to restrict call to ONLY this agent
+			$MANUALdial_matched=1;
+			$agent_only = $MANUALdial_user;
+			$ADfindSQL = "and agent_only='$agent_only'";
+			$ADUfindSQL = "and vicidial_live_agents.user='$agent_only'";
+			
+			### Force ring-agent mode for manual answer
+			$RING_agent=1;
+			$VDADon_hook_agent='Y';
+			if ($VDADon_hook_ring_time < 10) {$VDADon_hook_ring_time=45;}
+			
+			### Ensure extension is in proper format
+			if ($VDADextension !~ /^SIP\//i) 
+				{
+				$VDADextension = "SIP/$VDADextension";
+				}
+			
+			### Mark queue entry as processing (don't delete yet - will be deleted after ring starts)
+			$stmtA = "UPDATE vicidial_manual_dial_queue SET status='READY' WHERE mdq_id='$MANUALdial_mdq_id';";
+			my $MDQ_updated = $dbhA->do($stmtA);
+				$dbhP=$dbhA;   $mysql_count='02302';   $MEL_aff_rows=$MDQ_updated;   &mysql_error_logging;
+			
+			if ($AGILOG) {$agi_string = "MANUAL DIAL QUEUE MATCH: |$MANUALdial_user|$VDADconf_exten|$phone_number|AGENT_RESTRICTED|RING_MODE_ENABLED";   &agi_output;}
+			}
+		else
+			{
+			### User not available - delete queue entry immediately
+			$stmtA = "DELETE FROM vicidial_manual_dial_queue WHERE mdq_id='$MANUALdial_mdq_id';";
+			my $MDQ_deleted = $dbhA->do($stmtA);
+				$dbhP=$dbhA;   $mysql_count='02303';   $MEL_aff_rows=$MDQ_deleted;   &mysql_error_logging;
+			if ($AGILOG) {$agi_string = "MANUAL DIAL QUEUE DELETED (USER NOT READY): |$MANUALdial_user|$phone_number|";   &agi_output;}
+			}
+		}
+	$sthA->finish();
+	##### END Check for Manual Dial Queue agent (ATC Manual Answer)
+	################################################################
+
 	##### Attempt to send call to an agent on this server only #####
 	if ($agent_search_method =~ /^SO/)
 		{$agent_search_method = 'LO';}
@@ -2659,6 +2730,7 @@ while ( ($drop_timer <= $DROP_TIME) && ($wait_in_queue > 0) && ($MCdrop_override
 		##### Attempt to send call to an agent on any server #####
 		$cbc=0;
 		$rec_countWAITrem=0;
+		
 		### Get count of number of calls in this group that are ahead of this call
 		$stmtA = "SELECT count(*) FROM vicidial_auto_calls where status = 'LIVE' and campaign_id = '$channel_group' and call_time < \"$SQLdateBEGIN\" and lead_id != '$insert_lead_id' and queue_priority >= '$queue_priority' $ADfindSQL;";
 		$sthA = $dbhA->prepare($stmtA) or die "preparing: ",$dbhA->errstr;
@@ -2887,6 +2959,10 @@ while ( ($drop_timer <= $DROP_TIME) && ($wait_in_queue > 0) && ($MCdrop_override
 							if ($AGILOG) {$agi_string = "$VDADuser|$VDADgroup_weight|$stmtA|";   &agi_output;}
 							}
 						### END grade random next-agent-call routing ###
+
+
+						
+
 						else
 							{
 							$stmtA = "SELECT vicidial_live_agents.conf_exten,vicidial_live_agents.user,vicidial_live_agents.extension,vicidial_live_agents.server_ip,vicidial_live_inbound_agents.group_weight,ra_user,vicidial_live_agents.campaign_id,on_hook_agent,on_hook_ring_time,vicidial_live_inbound_agents.group_grade,vicidial_live_agents.campaign_grade from vicidial_live_agents, vicidial_live_inbound_agents WHERE vicidial_live_agents.user=vicidial_live_inbound_agents.user and status IN('CLOSER','READY') and lead_id<1 $ADUfindSQL and vicidial_live_inbound_agents.group_id='$channel_group' and last_update_time > '$BDtsSQLdate' and vicidial_live_agents.user NOT IN($ring_no_answer_agents$vlia_users) and ring_callerid='' $qp_groupWAIT_camp_SQL $agent_call_order limit 1;";
@@ -3357,7 +3433,7 @@ while ( ($drop_timer <= $DROP_TIME) && ($wait_in_queue > 0) && ($MCdrop_override
 							$stmtA = "UPDATE vicidial_live_agents set ring_callerid='$callerid' where user='$ARuser[$ragp]';";
 							$RAFaffected_rows = $dbhA->do($stmtA);
 							$dbhP=$dbhA;   $mysql_count='02167';   $MEL_aff_rows=$RAFaffected_rows;   &mysql_error_logging;
-
+ 
 							%ast_ver_str = parse_asterisk_version($asterisk_version);
 							if (( $ast_ver_str{major} = 1 ) && ($ast_ver_str{minor} < 12))
 								{ $RINGALLexten = "8331*$auto_call_id*$callerid*$ARuser[$ragp]*$ARdialplan_number[$ragp]"; }
